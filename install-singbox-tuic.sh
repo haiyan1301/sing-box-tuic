@@ -1314,10 +1314,22 @@ sing_box_version_number() {
   sing-box version 2>/dev/null | awk 'NR==1 { for (i=1; i<=NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+/) { gsub(/^v/, "", $i); print $i; exit } }'
 }
 
+normalize_version_number() {
+  local value="$1"
+  if [[ "$value" =~ ^v?([0-9]+)[.]([0-9]+)[.]([0-9]+) ]]; then
+    printf '%s.%s.%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
 version_at_least() {
   local current="$1"
   local required="$2"
   local current_major current_minor current_patch required_major required_minor required_patch
+  current="$(normalize_version_number "$current")" || return 1
+  required="$(normalize_version_number "$required")" || return 1
+
   IFS=. read -r current_major current_minor current_patch <<EOF
 $current
 EOF
