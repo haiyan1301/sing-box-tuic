@@ -32,6 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/insta
 wget -qO- https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/install-singbox-tuic.sh | sudo bash
 ```
 
+通过管道运行且需要传参数时，必须使用 `bash -s --`，参数要放在 `--` 后面。
+
 无人值守默认安装：
 
 ```bash
@@ -55,6 +57,8 @@ curl -fsSL https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/insta
   --ip 203.0.113.10 \
   --email admin@example.com
 ```
+
+`sudo bash --yes` 是错误写法，`--yes` 会被 Bash 当成自己的参数解析。
 
 ## 本地执行
 

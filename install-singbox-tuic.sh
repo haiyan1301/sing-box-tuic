@@ -35,6 +35,7 @@ CONGESTION="cubic"
 YES=0
 OPEN_FIREWALL=1
 START_SERVICE=1
+INTERACTIVE_INPUT="/dev/stdin"
 
 PORT_SET=0
 UUID_SET=0
@@ -424,7 +425,7 @@ json_string() {
 read_menu_choice() {
   local prompt="$1"
   local choice
-  read -r -p "$prompt" choice || exit 1
+  read -r -p "$prompt" choice <"$INTERACTIVE_INPUT" || exit 1
   printf '%s' "${choice:-1}"
 }
 
@@ -461,7 +462,7 @@ prompt_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$input_prompt" value || exit 1
+          read -r -p "$input_prompt" value <"$INTERACTIVE_INPUT" || exit 1
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -512,7 +513,7 @@ prompt_optional_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$input_prompt" value || exit 1
+          read -r -p "$input_prompt" value <"$INTERACTIVE_INPUT" || exit 1
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -963,15 +964,81 @@ download_install_script() {
   fi
 }
 
-install_sing_box() {
-  if have_cmd sing-box; then
-    info "检测到 sing-box: $(sing-box version 2>/dev/null | head -n 1 || printf 'installed')"
+sing_box_version_number() {
+  sing-box version 2>/dev/null | awk 'NR==1 { for (i=1; i<=NF; i++) if ($i ~ /^v?[0-9]+[.][0-9]+[.][0-9]+/) { gsub(/^v/, "", $i); print $i; exit } }'
+}
+
+version_at_least() {
+  local current="$1"
+  local required="$2"
+  local current_major current_minor current_patch required_major required_minor required_patch
+  IFS=. read -r current_major current_minor current_patch <<EOF
+$current
+EOF
+  IFS=. read -r required_major required_minor required_patch <<EOF
+$required
+EOF
+  current_major="${current_major:-0}"
+  current_minor="${current_minor:-0}"
+  current_patch="${current_patch:-0}"
+  required_major="${required_major:-0}"
+  required_minor="${required_minor:-0}"
+  required_patch="${required_patch:-0}"
+
+  [ "$current_major" -gt "$required_major" ] && return 0
+  [ "$current_major" -lt "$required_major" ] && return 1
+  [ "$current_minor" -gt "$required_minor" ] && return 0
+  [ "$current_minor" -lt "$required_minor" ] && return 1
+  [ "$current_patch" -ge "$required_patch" ]
+}
+
+install_sing_box_package() {
+  local channel="$1"
+  if [ "$channel" = "beta" ]; then
+    download_install_script | sh -s -- --beta
+  else
+    download_install_script | sh
+  fi
+}
+
+ensure_sing_box_supports_acme_provider() {
+  local version
+  version="$(sing_box_version_number || true)"
+  if [ -n "$version" ] && version_at_least "$version" "1.14.0"; then
     return 0
   fi
 
-  info "未检测到 sing-box，开始使用官方安装脚本安装稳定版"
-  download_install_script | sh
+  warn "当前 sing-box ${version:-unknown} 不支持 certificate_providers/profile，ACME 证书模式需要 1.14+"
+  info "开始安装官方 beta 版本以支持 ACME provider 和 IP shortlived profile"
+  install_sing_box_package beta
+  version="$(sing_box_version_number || true)"
+  if [ -n "$version" ] && version_at_least "$version" "1.14.0"; then
+    success "sing-box 已升级到支持 ACME provider 的版本: $(sing-box version 2>/dev/null | head -n 1)"
+    return 0
+  fi
+  die "安装 beta 后 sing-box 仍低于 1.14.0，无法配置 ACME 域名/IP 证书。请先安装 sing-box 1.14+ 后重试。"
+}
+
+install_sing_box() {
+  if have_cmd sing-box; then
+    info "检测到 sing-box: $(sing-box version 2>/dev/null | head -n 1 || printf 'installed')"
+    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+      ensure_sing_box_supports_acme_provider
+    fi
+    return 0
+  fi
+
+  if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+    info "未检测到 sing-box，ACME 证书模式将安装官方 beta 版本"
+    install_sing_box_package beta
+  else
+    info "未检测到 sing-box，开始使用官方安装脚本安装稳定版"
+    install_sing_box_package stable
+  fi
   have_cmd sing-box || die "sing-box 安装失败：安装后仍找不到 sing-box 命令"
+  if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+    ensure_sing_box_supports_acme_provider
+  fi
   success "sing-box 安装完成: $(sing-box version 2>/dev/null | head -n 1 || printf 'installed')"
 }
 
@@ -1442,7 +1509,14 @@ main() {
   if [ "$YES" -eq 1 ]; then
     noninteractive_defaults
   else
-    [ -t 0 ] || die "非交互环境请使用 --yes，并通过参数提供必需值"
+    if [ ! -t 0 ]; then
+      if [ -r /dev/tty ]; then
+        INTERACTIVE_INPUT="/dev/tty"
+        warn "检测到脚本来自管道输入，交互将改从 /dev/tty 读取"
+      else
+        die "非交互环境请使用: bash -s -- --yes，并通过参数提供必需值"
+      fi
+    fi
     interactive_wizard
   fi
 
