@@ -53,25 +53,94 @@ START_SERVICE_SET=0
 
 BACK_CODE=22
 
+BOLD=""
+RESET=""
+DIM=""
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+CYAN=""
+MAGENTA=""
+
+init_colors() {
+  if [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then
+    return 0
+  fi
+  if [ ! -t 1 ] && [ ! -t 2 ]; then
+    return 0
+  fi
+
+  BOLD=$'\033[1m'
+  RESET=$'\033[0m'
+  DIM=$'\033[2m'
+  RED=$'\033[31m'
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  BLUE=$'\033[34m'
+  CYAN=$'\033[36m'
+  MAGENTA=$'\033[35m'
+}
+
 info() {
-  printf '\033[1;34m[INFO]\033[0m %s\n' "$*" >&2
+  printf '%s[INFO]%s %s\n' "${BOLD}${BLUE}" "$RESET" "$*" >&2
 }
 
 success() {
-  printf '\033[1;32m[ OK ]\033[0m %s\n' "$*" >&2
+  printf '%s[ OK ]%s %s\n' "${BOLD}${GREEN}" "$RESET" "$*" >&2
 }
 
 warn() {
-  printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2
+  printf '%s[WARN]%s %s\n' "${BOLD}${YELLOW}" "$RESET" "$*" >&2
 }
 
 error() {
-  printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2
+  printf '%s[FAIL]%s %s\n' "${BOLD}${RED}" "$RESET" "$*" >&2
 }
 
 die() {
   error "$*"
   exit 1
+}
+
+heading() {
+  printf '\n%s%s%s\n' "${BOLD}${CYAN}" "$*" "$RESET"
+}
+
+section_divider() {
+  printf '%s%s%s\n' "$DIM" "------------------------------------------------------------" "$RESET"
+}
+
+menu_item() {
+  local key="$1"
+  local label="$2"
+  local value="${3:-}"
+  local style="${4:-normal}"
+  local key_color="$BLUE"
+
+  case "$style" in
+    default) key_color="$GREEN" ;;
+    custom) key_color="$CYAN" ;;
+    optional) key_color="$MAGENTA" ;;
+    nav) key_color="$YELLOW" ;;
+    danger) key_color="$RED" ;;
+  esac
+
+  if [ -n "$value" ]; then
+    printf '  %s%s%s) %s%s%s: %s%s%s\n' "$key_color" "$key" "$RESET" "$BOLD" "$label" "$RESET" "$CYAN" "$value" "$RESET"
+  else
+    printf '  %s%s%s) %s%s%s\n' "$key_color" "$key" "$RESET" "$BOLD" "$label" "$RESET"
+  fi
+}
+
+prompt_text() {
+  printf '%s%s%s' "${BOLD}${CYAN}" "$*" "$RESET"
+}
+
+label_value() {
+  local label="$1"
+  local value="$2"
+  printf '%s%-18s%s %s%s%s\n' "$BOLD" "${label}:" "$RESET" "$CYAN" "$value" "$RESET"
 }
 
 usage() {
@@ -425,7 +494,7 @@ json_string() {
 read_menu_choice() {
   local prompt="$1"
   local choice
-  read -r -p "$prompt" choice <"$INTERACTIVE_INPUT" || exit 1
+  read -r -p "$(prompt_text "$prompt")" choice <"$INTERACTIVE_INPUT" || exit 1
   printf '%s' "${choice:-1}"
 }
 
@@ -438,15 +507,15 @@ prompt_value() {
   local choice value
 
   while true; do
-    printf '\n%s\n' "$title"
+    heading "$title"
     if [ -n "$default_value" ]; then
-      printf '  1) 使用脚本默认值: %s\n' "$default_value"
+      menu_item "1" "使用脚本默认值" "$default_value" default
     else
-      printf '  1) 使用脚本默认值: 无可用默认值\n'
+      menu_item "1" "使用脚本默认值" "无可用默认值" default
     fi
-    printf '  2) 自定义输入\n'
-    printf '  b) 返回上一步\n'
-    printf '  q) 退出\n'
+    menu_item "2" "自定义输入" "" custom
+    menu_item "b" "返回上一步" "" nav
+    menu_item "q" "退出" "" danger
 
     choice="$(read_menu_choice "请选择 [默认: 1]: ")"
     case "$choice" in
@@ -462,7 +531,7 @@ prompt_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$input_prompt" value <"$INTERACTIVE_INPUT" || exit 1
+          read -r -p "$(prompt_text "$input_prompt")" value <"$INTERACTIVE_INPUT" || exit 1
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -491,16 +560,16 @@ prompt_optional_value() {
   local choice value
 
   while true; do
-    printf '\n%s\n' "$title"
+    heading "$title"
     if [ -n "$default_value" ]; then
-      printf '  1) 使用脚本默认值: %s\n' "$default_value"
+      menu_item "1" "使用脚本默认值" "$default_value" default
     else
-      printf '  1) 使用脚本默认值: 跳过\n'
+      menu_item "1" "使用脚本默认值" "跳过" default
     fi
-    printf '  2) 自定义输入\n'
-    printf '  s) 跳过本项\n'
-    printf '  b) 返回上一步\n'
-    printf '  q) 退出\n'
+    menu_item "2" "自定义输入" "" custom
+    menu_item "s" "跳过本项" "" optional
+    menu_item "b" "返回上一步" "" nav
+    menu_item "q" "退出" "" danger
 
     choice="$(read_menu_choice "请选择 [默认: 1]: ")"
     case "$choice" in
@@ -513,7 +582,7 @@ prompt_optional_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$input_prompt" value <"$INTERACTIVE_INPUT" || exit 1
+          read -r -p "$(prompt_text "$input_prompt")" value <"$INTERACTIVE_INPUT" || exit 1
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -546,16 +615,16 @@ prompt_bool() {
   local choice
 
   while true; do
-    printf '\n%s\n' "$title"
+    heading "$title"
     if [ "$default_value" -eq 1 ]; then
-      printf '  1) 使用脚本默认值: %s\n' "$yes_label"
-      printf '  2) %s\n' "$no_label"
+      menu_item "1" "使用脚本默认值" "$yes_label" default
+      menu_item "2" "$no_label" "" custom
     else
-      printf '  1) 使用脚本默认值: %s\n' "$no_label"
-      printf '  2) %s\n' "$yes_label"
+      menu_item "1" "使用脚本默认值" "$no_label" default
+      menu_item "2" "$yes_label" "" custom
     fi
-    printf '  b) 返回上一步\n'
-    printf '  q) 退出\n'
+    menu_item "b" "返回上一步" "" nav
+    menu_item "q" "退出" "" danger
 
     choice="$(read_menu_choice "请选择 [默认: 1]: ")"
     case "$choice" in
@@ -592,13 +661,13 @@ prompt_cert_mode() {
   fi
 
   while true; do
-    printf '\n证书模式\n'
-    printf '  1) 使用脚本默认值: 自签证书\n'
-    printf '  2) ACME 域名证书\n'
-    printf '  3) ACME IP 证书\n'
-    printf '  4) 已有证书路径\n'
-    printf '  b) 返回上一步\n'
-    printf '  q) 退出\n'
+    heading "证书模式"
+    menu_item "1" "使用脚本默认值" "自签证书" default
+    menu_item "2" "ACME 域名证书" "" custom
+    menu_item "3" "ACME IP 证书" "" custom
+    menu_item "4" "已有证书路径" "" custom
+    menu_item "b" "返回上一步" "" nav
+    menu_item "q" "退出" "" danger
     choice="$(read_menu_choice "请选择 [默认: 1]: ")"
     case "$choice" in
       1)
@@ -857,9 +926,9 @@ prompt_service_step() {
 interactive_wizard() {
   local step=1
   local rc
-  printf '\n'
-  info "sing-box TUIC 快捷安装向导"
-  info "每一步按 Enter 使用脚本默认值，输入 2 可自定义，输入 b 返回。"
+  heading "sing-box TUIC 快捷安装向导"
+  section_divider
+  printf '%s%s%s\n' "$DIM" "每一步按 Enter 使用脚本默认值，输入 2 可自定义，输入 b 返回。" "$RESET"
 
   while [ "$step" -le 6 ]; do
     rc=0
@@ -1439,7 +1508,7 @@ print_client_example() {
 
   cat <<EOF
 
-客户端 TUIC outbound 示例:
+$(heading "客户端 TUIC outbound 示例")
 {
   "type": "tuic",
   "tag": "tuic-out",
@@ -1456,52 +1525,52 @@ EOF
 }
 
 print_summary() {
-  printf '\n'
-  success "sing-box TUIC 配置完成"
-  printf '配置文件: %s\n' "$CONFIG_FILE"
-  printf '协议: TUIC only\n'
-  printf '监听: 0.0.0.0:%s/udp\n' "$PORT"
-  printf 'UUID: %s\n' "$UUID_VALUE"
-  printf 'Password: %s\n' "$PASSWORD_VALUE"
-  printf '拥塞控制: %s\n' "$CONGESTION"
-  printf '证书模式: %s\n' "$CERT_MODE"
+  heading "sing-box TUIC 配置完成"
+  section_divider
+  label_value "配置文件" "$CONFIG_FILE"
+  label_value "协议" "TUIC only"
+  label_value "监听" "0.0.0.0:${PORT}/udp"
+  label_value "UUID" "$UUID_VALUE"
+  label_value "Password" "$PASSWORD_VALUE"
+  label_value "拥塞控制" "$CONGESTION"
+  label_value "证书模式" "$CERT_MODE"
   case "$CERT_MODE" in
     self)
-      printf '证书: %s\n' "$CERT_FILE"
+      label_value "证书" "$CERT_FILE"
       warn "自签证书模式下，客户端需启用 tls.insecure=true，或自行导入证书信任。"
       ;;
     acme-domain)
-      printf 'ACME 域名: %s\n' "$DOMAIN_VALUE"
+      label_value "ACME 域名" "$DOMAIN_VALUE"
       ;;
     acme-ip)
-      printf 'ACME IP: %s\n' "$IP_VALUE"
-      printf '证书 Profile: shortlived\n'
-      printf '手动触发验证/续签检查: %s\n' "$RENEW_SCRIPT"
-      printf '查看自动续签检查 timer: systemctl list-timers %s\n' "$(basename "$RENEW_TIMER")"
-      printf '查看续签检查日志: journalctl -u %s --output cat -e\n' "$(basename "$RENEW_SERVICE")"
+      label_value "ACME IP" "$IP_VALUE"
+      label_value "证书 Profile" "shortlived"
+      label_value "手动续签检查" "$RENEW_SCRIPT"
+      label_value "查看 timer" "systemctl list-timers $(basename "$RENEW_TIMER")"
+      label_value "续签日志" "journalctl -u $(basename "$RENEW_SERVICE") --output cat -e"
       ;;
     existing)
-      printf '证书: %s\n' "$CERT_FILE"
-      printf '私钥: %s\n' "$KEY_FILE"
+      label_value "证书" "$CERT_FILE"
+      label_value "私钥" "$KEY_FILE"
       ;;
   esac
 
   if [ "$START_SERVICE" -eq 1 ]; then
-    printf '服务状态: '
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-      printf 'active\n'
+      label_value "服务状态" "active"
     else
-      printf 'inactive\n'
+      label_value "服务状态" "inactive"
     fi
-    printf '查看日志: journalctl -u %s --output cat -e\n' "$SERVICE_NAME"
+    label_value "查看日志" "journalctl -u ${SERVICE_NAME} --output cat -e"
   else
-    printf '启动服务: systemctl enable --now %s\n' "$SERVICE_NAME"
+    label_value "启动服务" "systemctl enable --now ${SERVICE_NAME}"
   fi
 
   print_client_example
 }
 
 main() {
+  init_colors
   parse_args "$@"
   validate_supplied_args
   ensure_environment
