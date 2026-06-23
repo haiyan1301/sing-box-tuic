@@ -769,6 +769,25 @@ read_menu_choice() {
   printf -v "$var_name" '%s' "${menu_choice:-1}"
 }
 
+split_prefixed_choice() {
+  local input="$1"
+  local choice_var="$2"
+  local rest_var="$3"
+  local rest
+
+  case "$input" in
+    2?*)
+      rest="${input:1}"
+      printf -v "$choice_var" '%s' "2"
+      printf -v "$rest_var" '%s' "$(trim_input "$rest")"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 prompt_value() {
   local var_name="$1"
   local title="$2"
@@ -789,6 +808,8 @@ prompt_value() {
     menu_item "q" "退出" "" danger
 
     read_menu_choice choice "请选择 [默认: 1]: "
+    value=""
+    split_prefixed_choice "$choice" choice value || true
     case "$choice" in
       1)
         if [ -z "$default_value" ]; then
@@ -802,12 +823,15 @@ prompt_value() {
         ;;
       2|c|C)
         while true; do
-          read_interactive_line value "$input_prompt"
+          if [ -z "$value" ]; then
+            read_interactive_line value "$input_prompt"
+          fi
           [ "$validator" = "validate_password" ] || value="$(trim_input "$value")"
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
           fi
+          value=""
         done
         ;;
       b|B)
@@ -844,6 +868,8 @@ prompt_optional_value() {
     menu_item "q" "退出" "" danger
 
     read_menu_choice choice "请选择 [默认: 1]: "
+    value=""
+    split_prefixed_choice "$choice" choice value || true
     case "$choice" in
       1)
         if [ -n "$default_value" ] && ! "$validator" "$default_value"; then
@@ -854,7 +880,9 @@ prompt_optional_value() {
         ;;
       2|c|C)
         while true; do
-          read_interactive_line value "$input_prompt"
+          if [ -z "$value" ]; then
+            read_interactive_line value "$input_prompt"
+          fi
           [ "$validator" = "validate_password" ] || value="$(trim_input "$value")"
           if [ -z "$value" ]; then
             printf -v "$var_name" '%s' ""
@@ -864,6 +892,7 @@ prompt_optional_value() {
             printf -v "$var_name" '%s' "$value"
             return 0
           fi
+          value=""
         done
         ;;
       s|S)
@@ -1561,7 +1590,7 @@ verify_acme_certificate() {
 }
 
 issue_acme_certificate() {
-  local acme_bin subject issue_args=()
+  local acme_bin subject issue_args=() issue_log issue_rc
   subject="$DOMAIN_VALUE"
   [ "$CERT_MODE" = "acme-ip" ] && subject="$IP_VALUE"
 
@@ -1591,7 +1620,21 @@ issue_acme_certificate() {
   fi
 
   info "开始用 acme.sh 申请证书: ${subject}"
-  "$acme_bin" "${issue_args[@]}" || die "acme.sh 证书申请失败：请检查域名/IP、DNS 解析、公网 TCP 80、防火墙和 CA 返回日志"
+  issue_log="$(mktemp)"
+  if "$acme_bin" "${issue_args[@]}" 2>&1 | tee "$issue_log"; then
+    issue_rc=0
+  else
+    issue_rc=$?
+  fi
+  if [ "$issue_rc" -ne 0 ]; then
+    if grep -Eq "Skipping\\. Next renewal time|Domains not changed|Add '--force' to force renewal" "$issue_log"; then
+      warn "acme.sh 检测到已有证书且未到续签时间，继续安装已有证书"
+    else
+      rm -f "$issue_log"
+      die "acme.sh 证书申请失败：请检查域名/IP、DNS 解析、公网 TCP 80、防火墙和 CA 返回日志"
+    fi
+  fi
+  rm -f "$issue_log"
 
   info "安装证书到 sing-box 读取路径"
   "$acme_bin" --install-cert -d "$subject" --ecc \
