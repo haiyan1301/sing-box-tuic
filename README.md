@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 默认安装官方稳定版 sing-box；ACME 域名/IP 证书模式会自动安装或升级到支持 ACME provider 的 beta/1.14+ 版本。
+- 默认安装官方稳定版 sing-box；ACME 域名/IP 证书模式使用 `acme.sh` 实际申请并安装证书，不依赖 sing-box beta 或 `certificate_providers`。
 - 生成 `/etc/sing-box/config.json`，仅包含 TUIC inbound 和 direct outbound。
 - 支持交互式向导：默认值、自定义输入、返回上一步。
 - 支持无人值守参数模式。
@@ -16,10 +16,11 @@
 - 写入配置前自动备份旧配置。
 - 执行 `sing-box check`，失败自动回滚。
 - 自动识别并配置 `ufw` 或 `firewalld`。
-- ACME IP 模式会安装每日续签检查 timer，并提供手动触发命令。
+- ACME 模式会把证书安装到 `/etc/sing-box/certs/tuic-acme.crt` 和 `/etc/sing-box/certs/tuic-acme.key`，并配置续签后的 reload 命令。
+- ACME IP 模式会额外安装每日续签检查 timer，并提供手动触发命令。
 - 默认自动彩色输出；如需禁用颜色，可使用 `NO_COLOR=1`。
 - 安装前校验端口、UUID、域名/IP、证书路径等输入；交互模式下输入错误会停留在当前项。
-- 配置完成后输出 TUIC 分享链接、终端二维码和 sing-box outbound JSON；二维码依赖 `qrencode`，缺失时脚本会尝试自动安装。
+- 配置完成后优先输出 sing-box outbound JSON、终端二维码和 PNG 二维码文件；TUIC URI 仅作为兼容分享链接输出。二维码依赖 `qrencode`，缺失时脚本会尝试自动安装。
 
 ## 快捷下载执行
 
@@ -100,6 +101,12 @@ sudo bash install-singbox-tuic.sh \
 
 ## ACME IP 证书续签检查
 
+ACME 证书由 `acme.sh` 申请和续签。域名/IP 证书签发成功后，脚本会把证书安装到 sing-box 的证书目录，并设置续签后的 reload 命令：
+
+```bash
+/usr/local/sbin/sing-box-tuic-acme-reload
+```
+
 ACME IP 模式会生成：
 
 ```bash
@@ -126,7 +133,19 @@ systemctl list-timers sing-box-tuic-renew.timer
 journalctl -u sing-box-tuic-renew.service --output cat -e
 ```
 
-ACME IP 证书验证需要公网可访问 `80/tcp` 和 `443/tcp`。TUIC 业务端口是脚本配置的 UDP 端口，默认 `443/udp`。
+ACME standalone 验证需要公网可访问 `80/tcp`。TUIC 业务端口是脚本配置的 UDP 端口，默认 `443/udp`。
+
+## 客户端配置输出
+
+安装完成后会输出并保存：
+
+```bash
+/root/sing-box-tuic-client.json
+/root/sing-box-tuic-client-json.png
+/root/sing-box-tuic-uri.png
+```
+
+`sing-box-tuic-client.json` 是 sing-box 客户端的推荐配置；`sing-box-tuic-client-json.png` 是该 JSON 的二维码。TUIC URI 不是统一标准，部分客户端无法识别，遇到导入失败时请使用 JSON 配置。
 
 ## 注意事项
 

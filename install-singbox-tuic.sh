@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # - https://sing-box.sagernet.org/installation/package-manager/
 # - https://sing-box.sagernet.org/configuration/inbound/tuic/
 # - https://sing-box.sagernet.org/configuration/shared/tls/
-# - https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/
+# - https://github.com/acmesh-official/acme.sh
 
 SCRIPT_NAME="${0##*/}"
 SERVICE_NAME="sing-box"
@@ -15,11 +15,16 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 CERT_DIR="${CONFIG_DIR}/certs"
 SELF_CERT_FILE="${CERT_DIR}/tuic-selfsigned.crt"
 SELF_KEY_FILE="${CERT_DIR}/tuic-selfsigned.key"
-ACME_DATA_DIR="/var/lib/sing-box/acme"
+ACME_CERT_FILE="${CERT_DIR}/tuic-acme.crt"
+ACME_KEY_FILE="${CERT_DIR}/tuic-acme.key"
+ACME_RELOAD_SCRIPT="/usr/local/sbin/sing-box-tuic-acme-reload"
 INSTALL_URL="https://sing-box.app/install.sh"
 RENEW_SCRIPT="/usr/local/sbin/sing-box-tuic-renew"
 RENEW_SERVICE="/etc/systemd/system/sing-box-tuic-renew.service"
 RENEW_TIMER="/etc/systemd/system/sing-box-tuic-renew.timer"
+CLIENT_JSON_FILE="/root/sing-box-tuic-client.json"
+CLIENT_JSON_QR_FILE="/root/sing-box-tuic-client-json.png"
+CLIENT_URI_QR_FILE="/root/sing-box-tuic-uri.png"
 
 PORT="443"
 UUID_VALUE=""
@@ -32,6 +37,7 @@ CERT_FILE=""
 KEY_FILE=""
 SERVER_NAME=""
 CONGESTION="cubic"
+ACME_SH_PATH=""
 YES=0
 OPEN_FIREWALL=1
 START_SERVICE=1
@@ -1359,44 +1365,15 @@ install_sing_box_package() {
   fi
 }
 
-ensure_sing_box_supports_acme_provider() {
-  local version
-  version="$(sing_box_version_number || true)"
-  if [ -n "$version" ] && version_at_least "$version" "1.14.0"; then
-    return 0
-  fi
-
-  warn "当前 sing-box ${version:-unknown} 不支持 certificate_providers/profile，ACME 证书模式需要 1.14+"
-  info "开始安装官方 beta 版本以支持 ACME provider 和 IP shortlived profile"
-  install_sing_box_package beta
-  version="$(sing_box_version_number || true)"
-  if [ -n "$version" ] && version_at_least "$version" "1.14.0"; then
-    success "sing-box 已升级到支持 ACME provider 的版本: $(sing-box version 2>/dev/null | head -n 1)"
-    return 0
-  fi
-  die "安装 beta 后 sing-box 仍低于 1.14.0，无法配置 ACME 域名/IP 证书。请先安装 sing-box 1.14+ 后重试。"
-}
-
 install_sing_box() {
   if have_cmd sing-box; then
     info "检测到 sing-box: $(sing-box version 2>/dev/null | head -n 1 || printf 'installed')"
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      ensure_sing_box_supports_acme_provider
-    fi
     return 0
   fi
 
-  if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-    info "未检测到 sing-box，ACME 证书模式将安装官方 beta 版本"
-    install_sing_box_package beta
-  else
-    info "未检测到 sing-box，开始使用官方安装脚本安装稳定版"
-    install_sing_box_package stable
-  fi
+  info "未检测到 sing-box，开始使用官方安装脚本安装稳定版"
+  install_sing_box_package stable
   have_cmd sing-box || die "sing-box 安装失败：安装后仍找不到 sing-box 命令"
-  if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-    ensure_sing_box_supports_acme_provider
-  fi
   success "sing-box 安装完成: $(sing-box version 2>/dev/null | head -n 1 || printf 'installed')"
 }
 
@@ -1448,14 +1425,196 @@ EOF
   KEY_FILE="$SELF_KEY_FILE"
 }
 
+ensure_acme_standalone_dependency() {
+  if have_cmd socat || have_cmd python3 || have_cmd python; then
+    return 0
+  fi
+  die "acme.sh standalone 模式需要 socat 或 python，请先安装 socat"
+}
+
+install_acme_runtime_dependencies() {
+  local needs_acme_install=0
+  local needs_package_install=0
+  local packages=""
+
+  if ! have_cmd acme.sh && [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
+    needs_acme_install=1
+  fi
+  if ! have_cmd socat && ! have_cmd python3 && ! have_cmd python; then
+    packages="${packages} socat"
+    needs_package_install=1
+  fi
+  if [ "$needs_acme_install" -eq 1 ] && ! have_cmd curl; then
+    packages="${packages} curl"
+    needs_package_install=1
+  fi
+
+  if [ "$needs_package_install" -eq 1 ]; then
+    info "安装 acme.sh standalone 依赖:${packages}"
+    if have_cmd apt-get; then
+      apt-get update
+      apt-get install -y $packages
+    elif have_cmd dnf; then
+      dnf install -y $packages
+    elif have_cmd yum; then
+      yum install -y $packages
+    elif have_cmd zypper; then
+      zypper --non-interactive install $packages
+    elif have_cmd pacman; then
+      pacman -Sy --noconfirm $packages
+    else
+      warn "未识别包管理器，无法自动安装:${packages}"
+    fi
+  fi
+
+  if [ "$needs_acme_install" -eq 1 ]; then
+    info "未检测到 acme.sh，开始安装 acme.sh"
+    have_cmd curl || die "安装 acme.sh 需要 curl，请先安装 curl"
+    if [ -n "$EMAIL_VALUE" ]; then
+      curl -fsSL https://get.acme.sh | sh -s email="$EMAIL_VALUE" || die "acme.sh 安装失败"
+    else
+      curl -fsSL https://get.acme.sh | sh || die "acme.sh 安装失败"
+    fi
+  fi
+
+  acme_sh_bin >/dev/null || die "acme.sh 安装后仍找不到 acme.sh 命令"
+  ensure_acme_standalone_dependency
+}
+
+acme_sh_bin() {
+  if have_cmd acme.sh; then
+    command -v acme.sh
+    return 0
+  fi
+  if [ -x "$HOME/.acme.sh/acme.sh" ]; then
+    printf '%s\n' "$HOME/.acme.sh/acme.sh"
+    return 0
+  fi
+  return 1
+}
+
+write_acme_reload_script() {
+cat >"$ACME_RELOAD_SCRIPT" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SERVICE_NAME="$SERVICE_NAME"
+CONFIG_DIR="$CONFIG_DIR"
+CONFIG_FILE="$CONFIG_FILE"
+CERT_DIR="$CERT_DIR"
+CERT_FILE="$ACME_CERT_FILE"
+KEY_FILE="$ACME_KEY_FILE"
+
+service_user="\$(systemctl show "\$SERVICE_NAME" -p User --value 2>/dev/null || true)"
+if [ -z "\$service_user" ] && id -u "\$SERVICE_NAME" >/dev/null 2>&1; then
+  service_user="\$SERVICE_NAME"
+fi
+service_group="\$(systemctl show "\$SERVICE_NAME" -p Group --value 2>/dev/null || true)"
+if [ -z "\$service_group" ] && [ -n "\${service_user:-}" ] && [ "\$service_user" != "root" ] && id -g "\$service_user" >/dev/null 2>&1; then
+  service_group="\$(id -gn "\$service_user")"
+fi
+service_group="\${service_group:-root}"
+
+chmod 755 "\$CONFIG_DIR" 2>/dev/null || true
+chown root:"\$service_group" "\$CONFIG_FILE" "\$CERT_DIR" "\$CERT_FILE" "\$KEY_FILE" 2>/dev/null || true
+chmod 640 "\$CONFIG_FILE" 2>/dev/null || true
+chmod 750 "\$CERT_DIR" 2>/dev/null || true
+chmod 644 "$ACME_CERT_FILE" 2>/dev/null || true
+chmod 600 "$ACME_KEY_FILE" 2>/dev/null || true
+chmod 640 "\$KEY_FILE" 2>/dev/null || true
+if systemctl is-active --quiet "\$SERVICE_NAME" && sing-box check -c "\$CONFIG_FILE" >/dev/null 2>&1; then
+  systemctl restart "\$SERVICE_NAME"
+else
+  echo "[INFO] \$SERVICE_NAME is not running or config is not ready; skip reload"
+fi
+EOF
+  chmod 755 "$ACME_RELOAD_SCRIPT"
+}
+
+verify_acme_certificate() {
+  local subject="$1"
+  have_cmd openssl || {
+    warn "未找到 openssl，跳过证书内容校验"
+    return 0
+  }
+
+  openssl x509 -in "$ACME_CERT_FILE" -noout -checkend 3600 >/dev/null 2>&1 || {
+    die "ACME 证书校验失败：证书不存在、格式无效或即将在 1 小时内过期"
+  }
+
+  local cert_text san_pattern
+  cert_text="$(openssl x509 -in "$ACME_CERT_FILE" -noout -text 2>/dev/null || true)"
+  if [ "$CERT_MODE" = "acme-ip" ]; then
+    san_pattern="IP Address:${subject}"
+  else
+    san_pattern="DNS:${subject}"
+  fi
+  if [ "$CERT_MODE" = "acme-ip" ] && [[ "$subject" == *:* ]]; then
+    printf '%s\n' "$cert_text" | grep -Fq "IP Address:" || {
+      die "ACME 证书校验失败：证书 SAN 中未找到 IP Address"
+    }
+    return 0
+  fi
+  printf '%s\n' "$cert_text" | grep -Fq "$san_pattern" || {
+    die "ACME 证书校验失败：证书 SAN 中未找到 ${san_pattern}"
+  }
+}
+
+issue_acme_certificate() {
+  local acme_bin subject issue_args=()
+  subject="$DOMAIN_VALUE"
+  [ "$CERT_MODE" = "acme-ip" ] && subject="$IP_VALUE"
+
+  install_acme_runtime_dependencies
+  acme_bin="$(acme_sh_bin)" || die "找不到 acme.sh 命令"
+  ACME_SH_PATH="$acme_bin"
+
+  mkdir -p "$CERT_DIR"
+  chmod 700 "$CERT_DIR"
+  write_acme_reload_script
+
+  "$acme_bin" --set-default-ca --server letsencrypt || die "设置 acme.sh 默认 CA 为 Let's Encrypt 失败"
+  if [ -n "$EMAIL_VALUE" ]; then
+    "$acme_bin" --register-account -m "$EMAIL_VALUE" --server letsencrypt || die "acme.sh 注册 Let's Encrypt 账号失败"
+  else
+    warn "未填写 ACME 邮箱，acme.sh 将使用无邮箱账号注册"
+    "$acme_bin" --register-account --server letsencrypt || true
+  fi
+
+  issue_args=(--issue --standalone --server letsencrypt --keylength ec-256 -d "$subject")
+  if [ "$CERT_MODE" = "acme-ip" ]; then
+    issue_args+=(--cert-profile shortlived --days 3)
+    warn "ACME IP 证书使用 Let's Encrypt shortlived profile；请确认 TCP 80 可被公网访问到本机"
+  else
+    warn "ACME 域名证书 standalone 验证需要 TCP 80 可被公网访问到本机"
+  fi
+
+  info "开始用 acme.sh 申请证书: ${subject}"
+  "$acme_bin" "${issue_args[@]}" || die "acme.sh 证书申请失败：请检查域名/IP、DNS 解析、公网 TCP 80、防火墙和 CA 返回日志"
+
+  info "安装证书到 sing-box 读取路径"
+  "$acme_bin" --install-cert -d "$subject" --ecc \
+    --fullchain-file "$ACME_CERT_FILE" \
+    --key-file "$ACME_KEY_FILE" \
+    --reloadcmd "$ACME_RELOAD_SCRIPT" || die "acme.sh 证书安装失败"
+
+  validate_file_exists "$ACME_CERT_FILE" || exit 1
+  validate_file_exists "$ACME_KEY_FILE" || exit 1
+  verify_acme_certificate "$subject"
+  chmod 644 "$ACME_CERT_FILE"
+  chmod 600 "$ACME_KEY_FILE"
+  CERT_FILE="$ACME_CERT_FILE"
+  KEY_FILE="$ACME_KEY_FILE"
+  success "ACME 证书已申请并安装: ${ACME_CERT_FILE}"
+}
+
 prepare_certificate() {
   case "$CERT_MODE" in
     self)
       make_self_signed_certificate
       ;;
     acme-domain|acme-ip)
-      mkdir -p "$ACME_DATA_DIR"
-      chmod 700 "$ACME_DATA_DIR"
+      issue_acme_certificate
       ;;
     existing)
       validate_file_exists "$CERT_FILE" || exit 1
@@ -1466,60 +1625,12 @@ prepare_certificate() {
 }
 
 write_tls_block() {
-  case "$CERT_MODE" in
-    self|existing)
-      cat <<EOF
+  cat <<EOF
       "tls": {
         "enabled": true,
         "certificate_path": $(json_string "$CERT_FILE"),
         "key_path": $(json_string "$KEY_FILE")
       }
-EOF
-      ;;
-    acme-domain|acme-ip)
-      cat <<EOF
-      "tls": {
-        "enabled": true,
-        "certificate_provider": "tuic-cert"
-      }
-EOF
-      ;;
-  esac
-}
-
-write_certificate_provider_block() {
-  local subject="$DOMAIN_VALUE"
-  [ "$CERT_MODE" = "acme-ip" ] && subject="$IP_VALUE"
-
-  cat <<EOF
-  "certificate_providers": [
-    {
-      "type": "acme",
-      "tag": "tuic-cert",
-      "domain": [
-        $(json_string "$subject")
-      ],
-      "data_directory": $(json_string "$ACME_DATA_DIR"),
-      "default_server_name": $(json_string "$subject"),
-      "provider": "letsencrypt"
-EOF
-  if [ -n "$EMAIL_VALUE" ]; then
-    cat <<EOF
-      ,
-      "email": $(json_string "$EMAIL_VALUE")
-EOF
-  fi
-  if [ "$CERT_MODE" = "acme-ip" ]; then
-    cat <<EOF
-      ,
-      "profile": "shortlived"
-EOF
-  fi
-  cat <<EOF
-      ,
-      "key_type": "p256"
-    }
-  ],
 EOF
 }
 
@@ -1536,9 +1647,6 @@ write_config_file() {
     "timestamp": true
   },
 EOF
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      write_certificate_provider_block
-    fi
     cat <<EOF
   "inbounds": [
     {
@@ -1589,6 +1697,73 @@ EOF
   printf '%s' "$backup_file"
 }
 
+service_run_user() {
+  local user
+  user="$(systemctl show "$SERVICE_NAME" -p User --value 2>/dev/null || true)"
+  if [ -n "$user" ]; then
+    printf '%s' "$user"
+  elif id -u "$SERVICE_NAME" >/dev/null 2>&1; then
+    printf '%s' "$SERVICE_NAME"
+  else
+    printf '%s' "root"
+  fi
+}
+
+service_run_group() {
+  local user="$1"
+  local group
+  group="$(systemctl show "$SERVICE_NAME" -p Group --value 2>/dev/null || true)"
+  if [ -n "$group" ]; then
+    printf '%s' "$group"
+  elif [ "$user" != "root" ] && id -g "$user" >/dev/null 2>&1; then
+    id -gn "$user"
+  else
+    printf '%s' "root"
+  fi
+}
+
+can_user_read_file() {
+  local user="$1"
+  local file="$2"
+  if [ "$user" = "root" ]; then
+    return 0
+  fi
+  if have_cmd runuser; then
+    runuser -u "$user" -- test -r "$file" >/dev/null 2>&1
+    return $?
+  fi
+  if have_cmd sudo; then
+    sudo -u "$user" test -r "$file" >/dev/null 2>&1
+    return $?
+  fi
+  [ -r "$file" ]
+}
+
+fix_runtime_permissions() {
+  local service_user service_group
+  service_user="$(service_run_user)"
+  service_group="$(service_run_group "$service_user")"
+
+  chmod 755 "$CONFIG_DIR"
+  chown root:"$service_group" "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE"
+  chmod 640 "$CONFIG_FILE"
+
+  if [ "$CERT_MODE" = "self" ] || [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+    chown root:"$service_group" "$CERT_DIR" 2>/dev/null || chown root:root "$CERT_DIR"
+    chmod 750 "$CERT_DIR"
+    chown root:"$service_group" "$CERT_FILE" "$KEY_FILE" 2>/dev/null || true
+    chmod 644 "$CERT_FILE"
+    chmod 640 "$KEY_FILE"
+  elif [ "$CERT_MODE" = "existing" ]; then
+    if ! can_user_read_file "$service_user" "$CERT_FILE"; then
+      warn "${SERVICE_NAME} 服务用户 ${service_user} 可能无法读取证书文件: ${CERT_FILE}"
+    fi
+    if ! can_user_read_file "$service_user" "$KEY_FILE"; then
+      warn "${SERVICE_NAME} 服务用户 ${service_user} 可能无法读取私钥文件: ${KEY_FILE}"
+    fi
+  fi
+}
+
 restore_backup() {
   local backup_file="$1"
   if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
@@ -1615,8 +1790,8 @@ configure_firewall() {
   if [ "$OPEN_FIREWALL" -ne 1 ]; then
     warn "已跳过防火墙配置；请确保放行 UDP ${PORT}"
     if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      warn "ACME 模式还需要 TCP 80 和 TCP 443 可被公网访问"
-      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80/443；TUIC 业务使用 UDP ${PORT}"
+      warn "ACME standalone 验证还需要 TCP 80 可被公网访问"
+      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80；TUIC 业务使用 UDP ${PORT}"
     fi
     return 0
   fi
@@ -1630,7 +1805,6 @@ configure_firewall() {
     fi
     if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
       ufw allow "80/tcp" || warn "ufw 放行 TCP 80 失败，请手动检查防火墙"
-      ufw allow "443/tcp" || warn "ufw 放行 TCP 443 失败，请手动检查防火墙"
     fi
     handled=1
   fi
@@ -1643,7 +1817,6 @@ configure_firewall() {
     fi
     if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
       firewall-cmd --permanent --add-port="80/tcp" || warn "firewalld 放行 TCP 80 失败，请手动检查防火墙"
-      firewall-cmd --permanent --add-port="443/tcp" || warn "firewalld 放行 TCP 443 失败，请手动检查防火墙"
     fi
     firewall-cmd --reload || warn "firewalld reload 失败，请手动执行 firewall-cmd --reload"
     handled=1
@@ -1652,8 +1825,8 @@ configure_firewall() {
   if [ "$handled" -eq 0 ]; then
     warn "未检测到已启用的 ufw/firewalld；请手动放行 UDP ${PORT}"
     if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      warn "ACME 模式还需要手动放行 TCP 80 和 TCP 443"
-      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80/443；TUIC 业务使用 UDP ${PORT}"
+      warn "ACME standalone 验证还需要手动放行 TCP 80"
+      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80；TUIC 业务使用 UDP ${PORT}"
     fi
   fi
 }
@@ -1668,27 +1841,34 @@ install_ip_certificate_renewal_helper() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CONFIG_FILE=$(json_string "$CONFIG_FILE")
-SERVICE_NAME=$(json_string "$SERVICE_NAME")
+ACME_SH="\${HOME}/.acme.sh/acme.sh"
+if [ -x "${ACME_SH_PATH}" ]; then
+  ACME_SH="${ACME_SH_PATH}"
+elif [ -x "\$ACME_SH" ]; then
+  ACME_SH="\$ACME_SH"
+else
+  ACME_SH="\$(command -v acme.sh 2>/dev/null || true)"
+fi
+[ -n "\$ACME_SH" ] && [ -x "\$ACME_SH" ] || {
+  echo "[FAIL] acme.sh not found"
+  exit 1
+}
 
-echo "[INFO] checking sing-box configuration: \${CONFIG_FILE}"
-sing-box check -c "\${CONFIG_FILE}"
+echo "[INFO] running acme.sh cron renewal check"
+"\$ACME_SH" --cron --home "\$(dirname "\$ACME_SH")"
 
-echo "[INFO] restarting \${SERVICE_NAME} to trigger ACME IP certificate check/renewal"
-systemctl restart "\${SERVICE_NAME}"
-
-echo "[INFO] service status"
-systemctl --no-pager --full status "\${SERVICE_NAME}" || true
+echo "[INFO] checking sing-box configuration"
+sing-box check -c "${CONFIG_FILE}"
 
 echo "[INFO] recent logs"
-journalctl -u "\${SERVICE_NAME}" --no-pager -n 80
+journalctl -u "${SERVICE_NAME}" --no-pager -n 80
 EOF
   chmod 755 "$RENEW_SCRIPT"
 
   cat >"$RENEW_SERVICE" <<EOF
 [Unit]
-Description=Check and trigger sing-box TUIC ACME IP certificate renewal
-Documentation=https://sing-box.sagernet.org/configuration/shared/certificate-provider/acme/
+Description=Renew sing-box TUIC ACME IP certificate
+Documentation=https://github.com/acmesh-official/acme.sh
 After=network-online.target
 Wants=network-online.target
 
@@ -1699,7 +1879,7 @@ EOF
 
   cat >"$RENEW_TIMER" <<EOF
 [Unit]
-Description=Daily sing-box TUIC ACME IP certificate renewal check
+Description=Daily sing-box TUIC ACME IP certificate renewal
 
 [Timer]
 OnCalendar=daily
@@ -1824,7 +2004,7 @@ build_tuic_uri() {
     query="${query}&allow_insecure=1"
   fi
 
-  printf 'tuic://%s:%s@%s:%s/?%s#%s' \
+  printf 'tuic://%s:%s@%s:%s?%s#%s' \
     "$(url_encode "$UUID_VALUE")" \
     "$(url_encode "$PASSWORD_VALUE")" \
     "$server" \
@@ -1855,30 +2035,7 @@ install_qrencode_if_missing() {
   have_cmd qrencode
 }
 
-print_tuic_share() {
-  local uri qr_type
-  uri="$(build_tuic_uri)"
-
-  heading "TUIC 分享链接"
-  printf '%s\n' "$uri"
-  warn "若客户端不支持 TUIC 分享链接，请使用下方 sing-box outbound JSON"
-
-  if server_value_is_placeholder; then
-    warn "分享链接中的 <your-server-ip> 需要替换为服务器 IP 或域名后再导入客户端"
-    return 0
-  fi
-
-  heading "TUIC 二维码"
-  if install_qrencode_if_missing; then
-    qr_type="ANSIUTF8"
-    [ -n "${NO_COLOR:-}" ] && qr_type="UTF8"
-    qrencode -t "$qr_type" "$uri" || warn "二维码生成失败，请使用上面的 TUIC 分享链接手动导入"
-  else
-    warn "无法自动安装 qrencode，请手动安装后使用分享链接生成二维码"
-  fi
-}
-
-print_client_example() {
+write_client_json() {
   local server tls_extra server_name_line
   server="$(client_server_value)"
   tls_extra=""
@@ -1893,7 +2050,6 @@ print_client_example() {
         \"insecure\": true"
   fi
 
-  heading "客户端 TUIC outbound 示例"
   cat <<EOF
 {
   "type": "tuic",
@@ -1910,9 +2066,72 @@ print_client_example() {
 EOF
 }
 
+save_client_json() {
+  mkdir -p "$(dirname -- "$CLIENT_JSON_FILE")"
+  write_client_json >"$CLIENT_JSON_FILE"
+  chmod 600 "$CLIENT_JSON_FILE"
+}
+
+print_client_qr() {
+  local client_json
+
+  if server_value_is_placeholder; then
+    warn "客户端配置中的服务器地址仍是占位符，替换为真实 IP/域名后再生成二维码"
+    return 0
+  fi
+
+  heading "客户端配置二维码 (sing-box JSON)"
+  if install_qrencode_if_missing; then
+    client_json="$(write_client_json)"
+    qrencode -t UTF8 "$client_json" || warn "终端 JSON 二维码生成失败，请使用保存的 JSON 文件"
+    mkdir -p "$(dirname -- "$CLIENT_JSON_QR_FILE")"
+    if qrencode -t PNG -o "$CLIENT_JSON_QR_FILE" "$client_json"; then
+      chmod 600 "$CLIENT_JSON_QR_FILE"
+      label_value "JSON 二维码 PNG" "$CLIENT_JSON_QR_FILE"
+    else
+      warn "JSON 二维码 PNG 保存失败"
+    fi
+  else
+    warn "无法自动安装 qrencode，已只输出客户端 JSON 文本"
+  fi
+}
+
+print_tuic_share() {
+  local uri
+  uri="$(build_tuic_uri)"
+
+  heading "TUIC 兼容分享链接"
+  printf '%s\n' "$uri"
+  warn "TUIC URI 不是所有客户端都支持；sing-box 客户端请优先使用上方 JSON 配置。"
+
+  if server_value_is_placeholder; then
+    warn "分享链接中的 <your-server-ip> 需要替换为服务器 IP 或域名后再导入客户端"
+    return 0
+  fi
+
+  if install_qrencode_if_missing; then
+    mkdir -p "$(dirname -- "$CLIENT_URI_QR_FILE")"
+    if qrencode -t PNG -o "$CLIENT_URI_QR_FILE" "$uri"; then
+      chmod 600 "$CLIENT_URI_QR_FILE"
+      label_value "URI 二维码 PNG" "$CLIENT_URI_QR_FILE"
+    else
+      warn "URI 二维码 PNG 保存失败"
+    fi
+  else
+    warn "无法自动安装 qrencode，已只输出 TUIC 兼容链接文本"
+  fi
+}
+
+print_client_example() {
+  heading "客户端 TUIC outbound JSON"
+  write_client_json
+  label_value "JSON 文件" "$CLIENT_JSON_FILE"
+}
+
 print_summary() {
   heading "sing-box TUIC 配置完成"
   section_divider
+  save_client_json
   label_value "配置文件" "$CONFIG_FILE"
   label_value "协议" "TUIC only"
   label_value "监听" "0.0.0.0:${PORT}/udp"
@@ -1927,10 +2146,15 @@ print_summary() {
       ;;
     acme-domain)
       label_value "ACME 域名" "$DOMAIN_VALUE"
+      label_value "证书" "$CERT_FILE"
+      label_value "私钥" "$KEY_FILE"
+      label_value "续签方式" "acme.sh 自动续签，续签后执行 ${ACME_RELOAD_SCRIPT}"
       ;;
     acme-ip)
       label_value "ACME IP" "$IP_VALUE"
       label_value "证书 Profile" "shortlived"
+      label_value "证书" "$CERT_FILE"
+      label_value "私钥" "$KEY_FILE"
       label_value "手动续签检查" "$RENEW_SCRIPT"
       label_value "查看 timer" "systemctl list-timers $(basename "$RENEW_TIMER")"
       label_value "续签日志" "journalctl -u $(basename "$RENEW_SERVICE") --output cat -e"
@@ -1952,8 +2176,9 @@ print_summary() {
     label_value "启动服务" "systemctl enable --now ${SERVICE_NAME}"
   fi
 
-  print_tuic_share
   print_client_example
+  print_client_qr
+  print_tuic_share
 }
 
 main() {
@@ -1978,12 +2203,13 @@ main() {
 
   validate_final_inputs
   install_sing_box
+  configure_firewall
   prepare_certificate
 
   local backup_file
   backup_file="$(write_config_file)"
+  fix_runtime_permissions
   check_config_or_rollback "$backup_file"
-  configure_firewall
   if [ "$START_SERVICE" -eq 1 ]; then
     install_ip_certificate_renewal_helper
   elif [ "$CERT_MODE" = "acme-ip" ]; then
