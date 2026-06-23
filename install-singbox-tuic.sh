@@ -36,6 +36,7 @@ YES=0
 OPEN_FIREWALL=1
 START_SERVICE=1
 INTERACTIVE_INPUT="/dev/stdin"
+INTERACTIVE_FD=""
 
 PORT_SET=0
 UUID_SET=0
@@ -137,6 +138,13 @@ prompt_text() {
   printf '%s%s%s' "${BOLD}${CYAN}" "$*" "$RESET"
 }
 
+trim_input() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
 label_value() {
   local label="$1"
   local value="$2"
@@ -176,16 +184,16 @@ EOF
 
 normalize_cert_mode() {
   case "$1" in
-    self|self-signed|selfsigned)
+    self)
       printf 'self'
       ;;
-    acme-domain|acme_domain|domain)
+    acme-domain)
       printf 'acme-domain'
       ;;
-    acme-ip|acme_ip|ip)
+    acme-ip)
       printf 'acme-ip'
       ;;
-    existing|path|file)
+    existing)
       printf 'existing'
       ;;
     *)
@@ -324,6 +332,9 @@ validate_supplied_args() {
   if [ "$KEY_FILE_SET" -eq 1 ]; then
     validate_file_exists "$KEY_FILE" || exit 1
   fi
+  if [ "$CERT_FILE_SET" -eq 1 ] && [ "$KEY_FILE_SET" -eq 1 ]; then
+    validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE" || exit 1
+  fi
   if [ "$SERVER_NAME_SET" -eq 1 ]; then
     validate_server_name "$SERVER_NAME" || exit 1
   fi
@@ -361,16 +372,26 @@ ensure_environment() {
 }
 
 validate_port() {
+  local port_number
   case "$1" in
     ''|*[!0-9]*)
       warn "端口必须是 1-65535 的数字"
       return 1
       ;;
   esac
-  [ "$1" -ge 1 ] && [ "$1" -le 65535 ] || {
+  [ "${#1}" -le 5 ] || {
     warn "端口必须在 1-65535 之间"
     return 1
   }
+  port_number=$((10#$1))
+  [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ] || {
+    warn "端口必须在 1-65535 之间"
+    return 1
+  }
+}
+
+normalize_port_value() {
+  printf '%d' "$((10#$1))"
 }
 
 validate_uuid() {
@@ -384,6 +405,14 @@ validate_uuid() {
 validate_password() {
   [ -n "$1" ] || {
     warn "密码不能为空"
+    return 1
+  }
+  [ "${#1}" -ge 8 ] || {
+    warn "密码长度不能小于 8 位"
+    return 1
+  }
+  [[ "$1" != *[[:space:]]* ]] || {
+    warn "密码不能包含空白字符"
     return 1
   }
 }
@@ -412,69 +441,259 @@ validate_cert_mode() {
   esac
 }
 
-validate_domain() {
-  [ -n "$1" ] || {
+validate_domain_name() {
+  local value="$1"
+  local require_dot="$2"
+  local label
+  local -a labels
+
+  [ -n "$value" ] || {
     warn "域名不能为空"
     return 1
   }
-  [[ "$1" =~ ^[A-Za-z0-9*.-]+$ ]] || {
-    warn "域名只能包含字母、数字、点、连字符或通配符"
+  if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    warn "域名不能是 IPv4 地址格式"
+    return 1
+  fi
+  [ "${#value}" -le 253 ] || {
+    warn "域名长度不能超过 253 个字符"
     return 1
   }
+  case "$value" in
+    *'*'*)
+      warn "ACME 域名不支持通配符"
+      return 1
+      ;;
+    *_*)
+      warn "域名不能包含下划线"
+      return 1
+      ;;
+    .*|*.)
+      warn "域名不能以点开头或结尾"
+      return 1
+      ;;
+    *..*)
+      warn "域名不能包含连续点"
+      return 1
+      ;;
+  esac
+  [ "$require_dot" -eq 0 ] || [[ "$value" == *.* ]] || {
+    warn "ACME 域名必须包含至少一个点"
+    return 1
+  }
+  [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]] || {
+    warn "域名只能包含字母、数字、点和连字符"
+    return 1
+  }
+  IFS='.' read -r -a labels <<<"$value"
+  for label in "${labels[@]}"; do
+    [ -n "$label" ] || {
+      warn "域名 label 不能为空"
+      return 1
+    }
+    [ "${#label}" -le 63 ] || {
+      warn "域名每段长度不能超过 63 个字符"
+      return 1
+    }
+    [[ "$label" =~ ^[A-Za-z0-9-]+$ ]] || {
+      warn "域名每段只能包含字母、数字和连字符"
+      return 1
+    }
+    case "$label" in
+      -*|*-)
+        warn "域名每段不能以连字符开头或结尾"
+        return 1
+        ;;
+    esac
+  done
+}
+
+validate_domain() {
+  validate_domain_name "$1" 1
+}
+
+validate_ipv4() {
+  local value="$1"
+  local part
+  local -a parts
+
+  [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  IFS='.' read -r -a parts <<<"$value"
+  for part in "${parts[@]}"; do
+    [ "$((10#$part))" -le 255 ] || return 1
+  done
+}
+
+validate_ipv6() {
+  local value="$1"
+  local group
+  local group_count=0
+  local has_compression=0
+  local without_first_compression
+  local -a groups
+
+  [[ "$value" == *:* ]] || return 1
+  [[ "$value" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ "$value" != *:::* ]] || return 1
+
+  without_first_compression="${value/::/}"
+  [[ "$without_first_compression" != *::* ]] || return 1
+
+  if [[ "$value" == *::* ]]; then
+    has_compression=1
+  fi
+  if [[ "$value" == :* && "$value" != ::* ]]; then
+    return 1
+  fi
+  if [[ "$value" == *: && "$value" != *:: ]]; then
+    return 1
+  fi
+
+  IFS=':' read -r -a groups <<<"$value"
+  for group in "${groups[@]}"; do
+    [ -n "$group" ] || continue
+    [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    group_count=$((group_count + 1))
+  done
+
+  if [ "$has_compression" -eq 1 ]; then
+    [ "$group_count" -le 7 ] || return 1
+  else
+    [ "$group_count" -eq 8 ] || return 1
+  fi
 }
 
 validate_ip() {
   local value="$1"
-  local part
-  local -a parts
   [ -n "$value" ] || {
     warn "IP 不能为空"
     return 1
   }
-  if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IFS='.' read -r -a parts <<<"$value"
-    for part in "${parts[@]}"; do
-      [ "$((10#$part))" -le 255 ] || {
-        warn "IPv4 地址无效"
-        return 1
-      }
-    done
+  if validate_ipv4 "$value"; then
     return 0
   fi
-  if [[ "$value" =~ ^[0-9A-Fa-f:]+$ ]] && [[ "$value" == *:* ]]; then
+  if validate_ipv6 "$value"; then
     return 0
   fi
-  warn "IP 地址格式无效"
+  warn "IP 地址格式无效；IPv4 每段必须为 0-255，IPv6 仅允许十六进制和冒号"
   return 1
 }
 
 validate_server_name() {
-  [ -n "$1" ] || {
+  local value="$1"
+
+  [ -n "$value" ] || {
     warn "server_name 不能为空"
     return 1
   }
-  [[ "$1" =~ ^[A-Za-z0-9*.:-]+$ ]] || {
-    warn "server_name 只能包含字母、数字、点、冒号、连字符或通配符"
-    return 1
-  }
+  case "$value" in
+    *://*|*/*|*\\*|*[[:space:]]*)
+      warn "server_name 不能包含空格、路径或 URL scheme"
+      return 1
+      ;;
+    *'*'*)
+      warn "server_name 不能使用通配符"
+      return 1
+      ;;
+  esac
+  if validate_ip "$value" >/dev/null 2>&1 || validate_domain_name "$value" 0 >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "server_name 必须是合法域名或 IP"
+  return 1
 }
 
 validate_email() {
-  [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || {
+  local value="$1"
+  local local_part domain_part
+
+  [[ "$value" == *@* ]] || {
+    warn "邮箱格式无效"
+    return 1
+  }
+  local_part="${value%@*}"
+  domain_part="${value#*@}"
+  [ "$local_part" != "$value" ] && [ "$domain_part" != "$value" ] || {
+    warn "邮箱格式无效"
+    return 1
+  }
+  [ -n "$local_part" ] && [ -n "$domain_part" ] || {
+    warn "邮箱格式无效"
+    return 1
+  }
+  [[ "$local_part" =~ ^[A-Za-z0-9._%+-]+$ ]] || {
+    warn "邮箱用户名只能包含字母、数字、点、下划线、百分号、加号和连字符"
+    return 1
+  }
+  case "$local_part" in
+    .*|*.|*..*)
+      warn "邮箱用户名不能以点开头或结尾，也不能包含连续点"
+      return 1
+      ;;
+  esac
+  validate_domain "$domain_part" >/dev/null 2>&1 || {
     warn "邮箱格式无效"
     return 1
   }
 }
 
 validate_file_exists() {
+  [ -n "$1" ] || {
+    warn "文件路径不能为空"
+    return 1
+  }
+  case "$1" in
+    /*)
+      ;;
+    *)
+      warn "证书和私钥路径必须使用绝对路径"
+      return 1
+      ;;
+  esac
   [ -f "$1" ] || {
-    warn "文件不存在: $1"
+    warn "文件不存在或不是普通文件: $1"
+    return 1
+  }
+  [ -r "$1" ] || {
+    warn "文件不可读: $1"
     return 1
   }
 }
 
+canonical_file_path() {
+  local path="$1"
+  local dir base real_dir
+
+  dir="$(dirname -- "$path")" || return 1
+  base="$(basename -- "$path")" || return 1
+  real_dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s' "$real_dir" "$base"
+}
+
+validate_distinct_cert_key_paths() {
+  local cert="$1"
+  local key="$2"
+  local cert_real key_real
+
+  if [ "$cert" = "$key" ]; then
+    warn "证书路径和私钥路径不能相同"
+    return 1
+  fi
+  if [ "$cert" -ef "$key" ]; then
+    warn "证书路径和私钥路径不能指向同一个文件"
+    return 1
+  fi
+
+  cert_real="$(canonical_file_path "$cert")" || cert_real="$cert"
+  key_real="$(canonical_file_path "$key")" || key_real="$key"
+  if [ "$cert_real" = "$key_real" ]; then
+    warn "证书路径和私钥路径不能指向同一个文件"
+    return 1
+  fi
+}
+
 looks_like_ip() {
-  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || [[ "$1" =~ ^[0-9A-Fa-f:]+$ && "$1" == *:* ]]
+  validate_ip "$1" >/dev/null 2>&1
 }
 
 json_escape() {
@@ -491,11 +710,37 @@ json_string() {
   printf '"%s"' "$(json_escape "$1")"
 }
 
+open_interactive_input() {
+  if [ -n "$INTERACTIVE_FD" ]; then
+    return 0
+  fi
+  exec 3<"$INTERACTIVE_INPUT" || die "无法读取交互输入: ${INTERACTIVE_INPUT}"
+  INTERACTIVE_FD=3
+}
+
+read_interactive_line() {
+  local var_name="$1"
+  local prompt="$2"
+
+  open_interactive_input
+  read -r -p "$(prompt_text "$prompt")" "$var_name" <&3 || exit 1
+}
+
+openssl_conf_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//,/\\,}
+  s=${s//=/\\=}
+  printf '%s' "$s"
+}
+
 read_menu_choice() {
-  local prompt="$1"
-  local choice
-  read -r -p "$(prompt_text "$prompt")" choice <"$INTERACTIVE_INPUT" || exit 1
-  printf '%s' "${choice:-1}"
+  local var_name="$1"
+  local prompt="$2"
+  local menu_choice
+  read_interactive_line menu_choice "$prompt"
+  menu_choice="$(trim_input "$menu_choice")"
+  printf -v "$var_name" '%s' "${menu_choice:-1}"
 }
 
 prompt_value() {
@@ -517,7 +762,7 @@ prompt_value() {
     menu_item "b" "返回上一步" "" nav
     menu_item "q" "退出" "" danger
 
-    choice="$(read_menu_choice "请选择 [默认: 1]: ")"
+    read_menu_choice choice "请选择 [默认: 1]: "
     case "$choice" in
       1)
         if [ -z "$default_value" ]; then
@@ -531,7 +776,8 @@ prompt_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$(prompt_text "$input_prompt")" value <"$INTERACTIVE_INPUT" || exit 1
+          read_interactive_line value "$input_prompt"
+          [ "$validator" = "validate_password" ] || value="$(trim_input "$value")"
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -571,7 +817,7 @@ prompt_optional_value() {
     menu_item "b" "返回上一步" "" nav
     menu_item "q" "退出" "" danger
 
-    choice="$(read_menu_choice "请选择 [默认: 1]: ")"
+    read_menu_choice choice "请选择 [默认: 1]: "
     case "$choice" in
       1)
         if [ -n "$default_value" ] && ! "$validator" "$default_value"; then
@@ -582,7 +828,12 @@ prompt_optional_value() {
         ;;
       2|c|C)
         while true; do
-          read -r -p "$(prompt_text "$input_prompt")" value <"$INTERACTIVE_INPUT" || exit 1
+          read_interactive_line value "$input_prompt"
+          [ "$validator" = "validate_password" ] || value="$(trim_input "$value")"
+          if [ -z "$value" ]; then
+            printf -v "$var_name" '%s' ""
+            return 0
+          fi
           if "$validator" "$value"; then
             printf -v "$var_name" '%s' "$value"
             return 0
@@ -626,7 +877,7 @@ prompt_bool() {
     menu_item "b" "返回上一步" "" nav
     menu_item "q" "退出" "" danger
 
-    choice="$(read_menu_choice "请选择 [默认: 1]: ")"
+    read_menu_choice choice "请选择 [默认: 1]: "
     case "$choice" in
       1)
         printf -v "$var_name" '%s' "$default_value"
@@ -668,7 +919,7 @@ prompt_cert_mode() {
     menu_item "4" "已有证书路径" "" custom
     menu_item "b" "返回上一步" "" nav
     menu_item "q" "退出" "" danger
-    choice="$(read_menu_choice "请选择 [默认: 1]: ")"
+    read_menu_choice choice "请选择 [默认: 1]: "
     case "$choice" in
       1)
         CERT_MODE="self"
@@ -872,7 +1123,7 @@ prompt_certificate_step() {
             ;;
           existing)
             if [ "$CERT_FILE_SET" -eq 1 ]; then
-              validate_file_exists "$CERT_FILE"
+              validate_file_exists "$CERT_FILE" || exit 1
             else
               if ! prompt_value CERT_FILE "已有证书路径" "" validate_file_exists "请输入 certificate_path: "; then
                 substep=1
@@ -880,12 +1131,16 @@ prompt_certificate_step() {
               fi
             fi
             if [ "$KEY_FILE_SET" -eq 1 ]; then
-              validate_file_exists "$KEY_FILE"
+              validate_file_exists "$KEY_FILE" || exit 1
             else
               if ! prompt_value KEY_FILE "已有私钥路径" "" validate_file_exists "请输入 key_path: "; then
                 substep=1
                 continue
               fi
+            fi
+            if ! validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE"; then
+              substep=2
+              continue
             fi
             if [ "$SERVER_NAME_SET" -eq 0 ]; then
               prompt_optional_value SERVER_NAME "客户端示例使用的 server_name" "" validate_server_name "请输入证书对应域名或 IP，可留空跳过: " || {
@@ -990,6 +1245,7 @@ noninteractive_defaults() {
 
 validate_final_inputs() {
   validate_port "$PORT" || exit 1
+  PORT="$(normalize_port_value "$PORT")"
   validate_uuid "$UUID_VALUE" || exit 1
   validate_password "$PASSWORD_VALUE" || exit 1
   validate_cert_mode "$CERT_MODE" || exit 1
@@ -1013,6 +1269,7 @@ validate_final_inputs() {
     existing)
       validate_file_exists "$CERT_FILE" || exit 1
       validate_file_exists "$KEY_FILE" || exit 1
+      validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE" || exit 1
       if [ -n "$SERVER_NAME" ]; then
         validate_server_name "$SERVER_NAME" || exit 1
       fi
@@ -1116,12 +1373,14 @@ make_self_signed_certificate() {
   mkdir -p "$CERT_DIR"
   chmod 700 "$CERT_DIR"
 
-  local cn="$SERVER_NAME"
+  local cn san_value
+  cn="$(openssl_conf_escape "$SERVER_NAME")"
   local san
   if looks_like_ip "$SERVER_NAME"; then
     san="IP:${SERVER_NAME}"
   else
-    san="DNS:${SERVER_NAME}"
+    san_value="$(openssl_conf_escape "$SERVER_NAME")"
+    san="DNS:${san_value}"
   fi
 
   local openssl_conf
@@ -1169,6 +1428,7 @@ prepare_certificate() {
     existing)
       validate_file_exists "$CERT_FILE" || exit 1
       validate_file_exists "$KEY_FILE" || exit 1
+      validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE" || exit 1
       ;;
   esac
 }
@@ -1506,9 +1766,8 @@ print_client_example() {
         \"insecure\": true"
   fi
 
+  heading "客户端 TUIC outbound 示例"
   cat <<EOF
-
-$(heading "客户端 TUIC outbound 示例")
 {
   "type": "tuic",
   "tag": "tuic-out",
