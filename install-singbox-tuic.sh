@@ -710,6 +710,26 @@ json_string() {
   printf '"%s"' "$(json_escape "$1")"
 }
 
+url_encode() {
+  local value="$1"
+  local out="" char hex i
+  local LC_ALL=C
+
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      [A-Za-z0-9.~_-])
+        out+="$char"
+        ;;
+      *)
+        printf -v hex '%%%02X' "'$char"
+        out+="$hex"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 open_interactive_input() {
   if [ -n "$INTERACTIVE_FD" ]; then
     return 0
@@ -1751,6 +1771,101 @@ client_server_value() {
   esac
 }
 
+client_share_server_value() {
+  local server
+  server="$(client_server_value)"
+  case "$server" in
+    *:*)
+      if looks_like_ip "$server"; then
+        printf '[%s]' "$server"
+      else
+        printf '%s' "$server"
+      fi
+      ;;
+    *)
+      printf '%s' "$server"
+      ;;
+  esac
+}
+
+server_value_is_placeholder() {
+  case "$(client_server_value)" in
+    \<*\>)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_tuic_uri() {
+  local server query tag
+  server="$(client_share_server_value)"
+  tag="sing-box-tuic"
+  query="congestion_control=$(url_encode "$CONGESTION")&udp_relay_mode=native&alpn=h3"
+
+  if [ -n "$SERVER_NAME" ]; then
+    query="${query}&sni=$(url_encode "$SERVER_NAME")"
+  fi
+  if [ "$CERT_MODE" = "self" ]; then
+    query="${query}&allow_insecure=1"
+  fi
+
+  printf 'tuic://%s:%s@%s:%s/?%s#%s' \
+    "$(url_encode "$UUID_VALUE")" \
+    "$(url_encode "$PASSWORD_VALUE")" \
+    "$server" \
+    "$PORT" \
+    "$query" \
+    "$(url_encode "$tag")"
+}
+
+install_qrencode_if_missing() {
+  if have_cmd qrencode; then
+    return 0
+  fi
+
+  warn "未检测到 qrencode，尝试安装以显示二维码"
+  if have_cmd apt-get; then
+    apt-get update >/dev/null 2>&1 || true
+    apt-get install -y qrencode >/dev/null 2>&1 || true
+  elif have_cmd dnf; then
+    dnf install -y qrencode >/dev/null 2>&1 || true
+  elif have_cmd yum; then
+    yum install -y qrencode >/dev/null 2>&1 || true
+  elif have_cmd zypper; then
+    zypper --non-interactive install qrencode >/dev/null 2>&1 || true
+  elif have_cmd pacman; then
+    pacman -Sy --noconfirm qrencode >/dev/null 2>&1 || true
+  fi
+
+  have_cmd qrencode
+}
+
+print_tuic_share() {
+  local uri qr_type
+  uri="$(build_tuic_uri)"
+
+  heading "TUIC 分享链接"
+  printf '%s\n' "$uri"
+  warn "若客户端不支持 TUIC 分享链接，请使用下方 sing-box outbound JSON"
+
+  if server_value_is_placeholder; then
+    warn "分享链接中的 <your-server-ip> 需要替换为服务器 IP 或域名后再导入客户端"
+    return 0
+  fi
+
+  heading "TUIC 二维码"
+  if install_qrencode_if_missing; then
+    qr_type="ANSIUTF8"
+    [ -n "${NO_COLOR:-}" ] && qr_type="UTF8"
+    qrencode -t "$qr_type" "$uri" || warn "二维码生成失败，请使用上面的 TUIC 分享链接手动导入"
+  else
+    warn "无法自动安装 qrencode，请手动安装后使用分享链接生成二维码"
+  fi
+}
+
 print_client_example() {
   local server tls_extra server_name_line
   server="$(client_server_value)"
@@ -1825,6 +1940,7 @@ print_summary() {
     label_value "启动服务" "systemctl enable --now ${SERVICE_NAME}"
   fi
 
+  print_tuic_share
   print_client_example
 }
 
