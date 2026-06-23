@@ -21,7 +21,7 @@
 
 ## 快捷下载执行
 
-将脚本上传到 GitHub、Gist 或自己的静态文件服务后，把下面命令里的 URL 替换为实际 Raw 地址：
+直接使用 GitHub Raw 地址下载并执行：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/install-singbox-tuic.sh | sudo bash
