@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 安装官方稳定版 sing-box。
+- 默认安装官方稳定版 sing-box；ACME 域名/IP 证书模式会自动安装或升级到支持 ACME provider 的 beta/1.14+ 版本。
 - 生成 `/etc/sing-box/config.json`，仅包含 TUIC inbound 和 direct outbound。
 - 支持交互式向导：默认值、自定义输入、返回上一步。
 - 支持无人值守参数模式。
@@ -17,7 +17,7 @@
 - 执行 `sing-box check`，失败自动回滚。
 - 自动识别并配置 `ufw` 或 `firewalld`。
 - ACME IP 模式会安装每日续签检查 timer，并提供手动触发命令。
-- 默认自动彩色输出；如需禁用颜色，可在命令前加 `NO_COLOR=1`。
+- 默认自动彩色输出；如需禁用颜色，可使用 `NO_COLOR=1`。
 
 ## 快捷下载执行
 
@@ -34,6 +34,12 @@ wget -qO- https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/instal
 ```
 
 通过管道运行且需要传参数时，必须使用 `bash -s --`，参数要放在 `--` 后面。
+
+禁用彩色输出：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/haiyan1301/sing-box-tuic/main/install-singbox-tuic.sh | sudo env NO_COLOR=1 bash
+```
 
 无人值守默认安装：
 

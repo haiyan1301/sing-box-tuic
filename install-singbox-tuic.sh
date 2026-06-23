@@ -1597,7 +1597,11 @@ main() {
   backup_file="$(write_config_file)"
   check_config_or_rollback "$backup_file"
   configure_firewall
-  install_ip_certificate_renewal_helper
+  if [ "$START_SERVICE" -eq 1 ]; then
+    install_ip_certificate_renewal_helper
+  elif [ "$CERT_MODE" = "acme-ip" ]; then
+    warn "已跳过服务启动，因此不会启用 ACME IP 自动续签检查 timer"
+  fi
   restart_service_or_rollback "$backup_file"
   print_summary
 }
