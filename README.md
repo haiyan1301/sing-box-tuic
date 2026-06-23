@@ -17,7 +17,7 @@
 - 执行 `sing-box check`，失败自动回滚。
 - 自动识别并配置 `ufw` 或 `firewalld`。
 - ACME 模式会把证书安装到 `/etc/sing-box/certs/tuic-acme.crt` 和 `/etc/sing-box/certs/tuic-acme.key`，并配置续签后的 reload 命令。
-- ACME IP 模式会额外安装每日续签检查 timer，并提供手动触发命令。
+- ACME 自动续签使用 `acme.sh` 安装器自带的 cron，不额外创建 systemd 续签 timer。
 - 默认自动彩色输出；如需禁用颜色，可使用 `NO_COLOR=1`。
 - 安装前校验端口、UUID、域名/IP、证书路径等输入；交互模式下输入错误会停留在当前项。
 - 配置完成后优先输出 sing-box outbound JSON、终端二维码和 PNG 二维码文件；TUIC URI 仅作为兼容分享链接输出。二维码依赖 `qrencode`，缺失时脚本会尝试自动安装。
@@ -99,7 +99,7 @@ sudo bash install-singbox-tuic.sh \
 
 已有证书模式要求证书和私钥路径必须是绝对路径、可读普通文件，并且不能指向同一个文件。ACME 域名不接受通配符、下划线、连续点、空 label 或首尾连字符。
 
-## ACME IP 证书续签检查
+## ACME 自动续签
 
 ACME 证书由 `acme.sh` 申请和续签。域名/IP 证书签发成功后，脚本会把证书安装到 sing-box 的证书目录，并设置续签后的 reload 命令：
 
@@ -107,30 +107,18 @@ ACME 证书由 `acme.sh` 申请和续签。域名/IP 证书签发成功后，脚
 /usr/local/sbin/sing-box-tuic-acme-reload
 ```
 
-ACME IP 模式会生成：
+脚本会调用 `acme.sh --install-cronjob` 确保存在每日 cron 任务。续签成功后，`acme.sh` 会重新安装证书到 `/etc/sing-box/certs/`，再执行上面的 reload 命令重启 sing-box。
+
+手动查看 `acme.sh` 续签任务：
 
 ```bash
-/usr/local/sbin/sing-box-tuic-renew
-/etc/systemd/system/sing-box-tuic-renew.service
-/etc/systemd/system/sing-box-tuic-renew.timer
+crontab -l | grep acme.sh
 ```
 
-手动触发验证和续签检查：
+手动触发 `acme.sh` 续签检查：
 
 ```bash
-sudo /usr/local/sbin/sing-box-tuic-renew
-```
-
-查看 timer：
-
-```bash
-systemctl list-timers sing-box-tuic-renew.timer
-```
-
-查看日志：
-
-```bash
-journalctl -u sing-box-tuic-renew.service --output cat -e
+~/.acme.sh/acme.sh --cron
 ```
 
 ACME standalone 验证需要公网可访问 `80/tcp`。TUIC 业务端口是脚本配置的 UDP 端口，默认 `443/udp`。

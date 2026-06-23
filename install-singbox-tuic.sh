@@ -19,9 +19,9 @@ ACME_CERT_FILE="${CERT_DIR}/tuic-acme.crt"
 ACME_KEY_FILE="${CERT_DIR}/tuic-acme.key"
 ACME_RELOAD_SCRIPT="/usr/local/sbin/sing-box-tuic-acme-reload"
 INSTALL_URL="https://sing-box.app/install.sh"
-RENEW_SCRIPT="/usr/local/sbin/sing-box-tuic-renew"
-RENEW_SERVICE="/etc/systemd/system/sing-box-tuic-renew.service"
-RENEW_TIMER="/etc/systemd/system/sing-box-tuic-renew.timer"
+LEGACY_RENEW_SCRIPT="/usr/local/sbin/sing-box-tuic-renew"
+LEGACY_RENEW_SERVICE="/etc/systemd/system/sing-box-tuic-renew.service"
+LEGACY_RENEW_TIMER="/etc/systemd/system/sing-box-tuic-renew.timer"
 CLIENT_JSON_FILE="/root/sing-box-tuic-client.json"
 CLIENT_JSON_QR_FILE="/root/sing-box-tuic-client-json.png"
 CLIENT_URI_QR_FILE="/root/sing-box-tuic-uri.png"
@@ -1574,6 +1574,7 @@ issue_acme_certificate() {
   write_acme_reload_script
 
   "$acme_bin" --set-default-ca --server letsencrypt || die "设置 acme.sh 默认 CA 为 Let's Encrypt 失败"
+  "$acme_bin" --install-cronjob >/dev/null 2>&1 || warn "acme.sh cron 安装失败，请稍后手动执行: ${acme_bin} --install-cronjob"
   if [ -n "$EMAIL_VALUE" ]; then
     "$acme_bin" --register-account -m "$EMAIL_VALUE" --server letsencrypt || die "acme.sh 注册 Let's Encrypt 账号失败"
   else
@@ -1831,81 +1832,13 @@ configure_firewall() {
   fi
 }
 
-install_ip_certificate_renewal_helper() {
-  if [ "$CERT_MODE" != "acme-ip" ]; then
-    return 0
+cleanup_legacy_renewal_helper() {
+  if [ -f "$LEGACY_RENEW_SCRIPT" ] || [ -f "$LEGACY_RENEW_SERVICE" ] || [ -f "$LEGACY_RENEW_TIMER" ]; then
+    warn "清理旧版本遗留的自建续签 timer，证书续签改由 acme.sh 自带 cron 处理"
+    systemctl disable --now "$(basename "$LEGACY_RENEW_TIMER")" >/dev/null 2>&1 || true
+    rm -f "$LEGACY_RENEW_SCRIPT" "$LEGACY_RENEW_SERVICE" "$LEGACY_RENEW_TIMER"
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
-
-  info "安装 ACME IP 证书自动验证/续签检查命令"
-  cat >"$RENEW_SCRIPT" <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-ACME_SH="\${HOME}/.acme.sh/acme.sh"
-if [ -x "${ACME_SH_PATH}" ]; then
-  ACME_SH="${ACME_SH_PATH}"
-elif [ -x "\$ACME_SH" ]; then
-  ACME_SH="\$ACME_SH"
-else
-  ACME_SH="\$(command -v acme.sh 2>/dev/null || true)"
-fi
-[ -n "\$ACME_SH" ] && [ -x "\$ACME_SH" ] || {
-  echo "[FAIL] acme.sh not found"
-  exit 1
-}
-
-echo "[INFO] running acme.sh cron renewal check"
-"\$ACME_SH" --cron --home "\$(dirname "\$ACME_SH")"
-
-echo "[INFO] checking sing-box configuration"
-sing-box check -c "${CONFIG_FILE}"
-
-echo "[INFO] recent logs"
-journalctl -u "${SERVICE_NAME}" --no-pager -n 80
-EOF
-  chmod 755 "$RENEW_SCRIPT"
-
-  cat >"$RENEW_SERVICE" <<EOF
-[Unit]
-Description=Renew sing-box TUIC ACME IP certificate
-Documentation=https://github.com/acmesh-official/acme.sh
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${RENEW_SCRIPT}
-EOF
-
-  cat >"$RENEW_TIMER" <<EOF
-[Unit]
-Description=Daily sing-box TUIC ACME IP certificate renewal
-
-[Timer]
-OnCalendar=daily
-Persistent=true
-RandomizedDelaySec=1800
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now "$(basename "$RENEW_TIMER")" >/dev/null || {
-    warn "自动续签检查 timer 启用失败，可手动运行: ${RENEW_SCRIPT}"
-    return 0
-  }
-  success "已安装自动续签检查: $(basename "$RENEW_TIMER")"
-}
-
-remove_ip_certificate_renewal_helper() {
-  if [ "$CERT_MODE" != "acme-ip" ]; then
-    return 0
-  fi
-
-  systemctl disable --now "$(basename "$RENEW_TIMER")" >/dev/null 2>&1 || true
-  rm -f "$RENEW_SCRIPT" "$RENEW_SERVICE" "$RENEW_TIMER"
-  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 restart_service_or_rollback() {
@@ -1929,7 +1862,6 @@ restart_service_or_rollback() {
   fi
 
   warn "${SERVICE_NAME} 服务启动失败，尝试恢复旧配置"
-  remove_ip_certificate_renewal_helper
   restore_backup "$backup_file"
   if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -2155,9 +2087,7 @@ print_summary() {
       label_value "证书 Profile" "shortlived"
       label_value "证书" "$CERT_FILE"
       label_value "私钥" "$KEY_FILE"
-      label_value "手动续签检查" "$RENEW_SCRIPT"
-      label_value "查看 timer" "systemctl list-timers $(basename "$RENEW_TIMER")"
-      label_value "续签日志" "journalctl -u $(basename "$RENEW_SERVICE") --output cat -e"
+      label_value "续签方式" "acme.sh 自动 cron，续签后执行 ${ACME_RELOAD_SCRIPT}"
       ;;
     existing)
       label_value "证书" "$CERT_FILE"
@@ -2203,6 +2133,7 @@ main() {
 
   validate_final_inputs
   install_sing_box
+  cleanup_legacy_renewal_helper
   configure_firewall
   prepare_certificate
 
@@ -2210,11 +2141,6 @@ main() {
   backup_file="$(write_config_file)"
   fix_runtime_permissions
   check_config_or_rollback "$backup_file"
-  if [ "$START_SERVICE" -eq 1 ]; then
-    install_ip_certificate_renewal_helper
-  elif [ "$CERT_MODE" = "acme-ip" ]; then
-    warn "已跳过服务启动，因此不会启用 ACME IP 自动续签检查 timer"
-  fi
   restart_service_or_rollback "$backup_file"
   print_summary
 }
