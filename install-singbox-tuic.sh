@@ -466,12 +466,26 @@ ensure_base_commands() {
   info "检查并更新脚本依赖命令"
   package_update_index || warn "未能自动更新软件包索引；将继续检查已安装命令"
 
-  install_or_update_packages curl openssl qrencode || true
+  ensure_download_commands
+  ensure_crypto_commands
+  ensure_qrencode_command
 
   have_cmd curl || have_cmd wget || missing="${missing} curl/wget"
   have_cmd openssl || missing="${missing} openssl"
   have_cmd qrencode || warn "未检测到 qrencode，安装完成后将只输出 JSON 文本和分享链接"
   [ -z "$missing" ] || die "缺少必需命令:${missing}"
+}
+
+ensure_download_commands() {
+  install_or_update_packages curl || true
+}
+
+ensure_crypto_commands() {
+  install_or_update_packages openssl || true
+}
+
+ensure_qrencode_command() {
+  install_or_update_packages qrencode || true
 }
 
 validate_port() {
@@ -1732,18 +1746,30 @@ issue_acme_certificate() {
   success "ACME 证书已申请并安装: ${ACME_CERT_FILE}"
 }
 
+prepare_self_signed_certificate() {
+  make_self_signed_certificate
+}
+
+prepare_acme_certificate() {
+  issue_acme_certificate
+}
+
+prepare_existing_certificate() {
+  validate_file_exists "$CERT_FILE" || exit 1
+  validate_file_exists "$KEY_FILE" || exit 1
+  validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE" || exit 1
+}
+
 prepare_certificate() {
   case "$CERT_MODE" in
     self)
-      make_self_signed_certificate
+      prepare_self_signed_certificate
       ;;
     acme-domain|acme-ip)
-      issue_acme_certificate
+      prepare_acme_certificate
       ;;
     existing)
-      validate_file_exists "$CERT_FILE" || exit 1
-      validate_file_exists "$KEY_FILE" || exit 1
-      validate_distinct_cert_key_paths "$CERT_FILE" "$KEY_FILE" || exit 1
+      prepare_existing_certificate
       ;;
   esac
 }
@@ -1758,7 +1784,7 @@ write_tls_block() {
 EOF
 }
 
-write_config_file() {
+write_server_config_file() {
   local tmp_file backup_file timestamp
   mkdir -p "$CONFIG_DIR"
   tmp_file="$(mktemp)"
@@ -1910,49 +1936,63 @@ check_config_or_rollback() {
   die "配置校验失败，已停止安装流程"
 }
 
-configure_firewall() {
-  if [ "$OPEN_FIREWALL" -ne 1 ]; then
-    warn "已跳过防火墙配置；请确保放行 UDP ${PORT}"
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      warn "ACME standalone 验证还需要 TCP 80 可被公网访问"
-      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80；TUIC 业务使用 UDP ${PORT}"
-    fi
-    return 0
-  fi
+certificate_requires_acme_port() {
+  [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]
+}
 
-  local handled=0
+warn_manual_firewall_ports() {
+  local prefix="$1"
+  warn "${prefix} UDP ${PORT}"
+  if certificate_requires_acme_port; then
+    warn "ACME standalone 验证还需要 TCP 80 可被公网访问"
+    [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80；TUIC 业务使用 UDP ${PORT}"
+  fi
+}
+
+configure_ufw_firewall() {
   if have_cmd ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     info "检测到 ufw，放行端口"
     if ! ufw allow "${PORT}/udp"; then
       warn "ufw 放行 UDP ${PORT} 失败，请手动检查防火墙"
       return 0
     fi
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+    if certificate_requires_acme_port; then
       ufw allow "80/tcp" || warn "ufw 放行 TCP 80 失败，请手动检查防火墙"
     fi
-    handled=1
+    return 0
   fi
+  return 1
+}
 
+configure_firewalld_firewall() {
   if have_cmd firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
     info "检测到 firewalld，放行端口"
     if ! firewall-cmd --permanent --add-port="${PORT}/udp"; then
       warn "firewalld 放行 UDP ${PORT} 失败，请手动检查防火墙"
       return 0
     fi
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
+    if certificate_requires_acme_port; then
       firewall-cmd --permanent --add-port="80/tcp" || warn "firewalld 放行 TCP 80 失败，请手动检查防火墙"
     fi
     firewall-cmd --reload || warn "firewalld reload 失败，请手动执行 firewall-cmd --reload"
-    handled=1
+    return 0
+  fi
+  return 1
+}
+
+configure_firewall() {
+  if [ "$OPEN_FIREWALL" -ne 1 ]; then
+    warn_manual_firewall_ports "已跳过防火墙配置；请确保放行"
+    return 0
   fi
 
-  if [ "$handled" -eq 0 ]; then
-    warn "未检测到已启用的 ufw/firewalld；请手动放行 UDP ${PORT}"
-    if [ "$CERT_MODE" = "acme-domain" ] || [ "$CERT_MODE" = "acme-ip" ]; then
-      warn "ACME standalone 验证还需要手动放行 TCP 80"
-      [ "$CERT_MODE" = "acme-ip" ] && warn "ACME IP 证书验证使用 TCP 80；TUIC 业务使用 UDP ${PORT}"
-    fi
+  if configure_ufw_firewall; then
+    return 0
   fi
+  if configure_firewalld_firewall; then
+    return 0
+  fi
+  warn_manual_firewall_ports "未检测到已启用的 ufw/firewalld；请手动放行"
 }
 
 cleanup_legacy_renewal_helper() {
@@ -2196,10 +2236,7 @@ print_client_example() {
   label_value "JSON 文件" "$CLIENT_JSON_FILE"
 }
 
-print_summary() {
-  heading "sing-box TUIC 配置完成"
-  section_divider
-  save_client_json
+print_core_summary() {
   label_value "配置文件" "$CONFIG_FILE"
   label_value "协议" "TUIC only"
   label_value "监听" "0.0.0.0:${PORT}/udp"
@@ -2207,6 +2244,9 @@ print_summary() {
   label_value "Password" "$PASSWORD_VALUE"
   label_value "拥塞控制" "$CONGESTION"
   label_value "证书模式" "$CERT_MODE"
+}
+
+print_certificate_summary() {
   case "$CERT_MODE" in
     self)
       label_value "证书" "$CERT_FILE"
@@ -2230,7 +2270,9 @@ print_summary() {
       label_value "私钥" "$KEY_FILE"
       ;;
   esac
+}
 
+print_service_summary() {
   if [ "$START_SERVICE" -eq 1 ]; then
     if systemctl is-active --quiet "$SERVICE_NAME"; then
       label_value "服务状态" "active"
@@ -2241,45 +2283,78 @@ print_summary() {
   else
     label_value "启动服务" "systemctl enable --now ${SERVICE_NAME}"
   fi
+}
 
+print_client_outputs() {
   print_client_example
   print_client_qr
   print_tuic_share
+}
+
+print_summary() {
+  heading "sing-box TUIC 配置完成"
+  section_divider
+  save_client_json
+  print_core_summary
+  print_certificate_summary
+  print_service_summary
+  print_client_outputs
+}
+
+collect_user_options() {
+  if [ "$YES" -eq 1 ]; then
+    noninteractive_defaults
+    return 0
+  fi
+
+  if [ ! -t 0 ]; then
+    if [ -r /dev/tty ]; then
+      INTERACTIVE_INPUT="/dev/tty"
+      warn "检测到脚本来自管道输入，交互将改从 /dev/tty 读取"
+    else
+      die "非交互环境请使用: bash -s -- --yes，并通过参数提供必需值"
+    fi
+  fi
+  interactive_wizard
+}
+
+prepare_runtime() {
+  ensure_environment
+  ensure_base_commands
+}
+
+prepare_installation() {
+  validate_final_inputs
+  install_sing_box
+  cleanup_legacy_renewal_helper
+  configure_firewall
+  prepare_certificate
+}
+
+write_and_validate_server_config() {
+  local backup_file
+  backup_file="$(write_server_config_file)"
+  fix_runtime_permissions
+  check_config_or_rollback "$backup_file"
+  printf '%s' "$backup_file"
+}
+
+start_service_and_report() {
+  local backup_file="$1"
+  restart_service_or_rollback "$backup_file"
+  print_summary
 }
 
 main() {
   init_colors
   parse_args "$@"
   validate_supplied_args
-  ensure_environment
-  ensure_base_commands
-
-  if [ "$YES" -eq 1 ]; then
-    noninteractive_defaults
-  else
-    if [ ! -t 0 ]; then
-      if [ -r /dev/tty ]; then
-        INTERACTIVE_INPUT="/dev/tty"
-        warn "检测到脚本来自管道输入，交互将改从 /dev/tty 读取"
-      else
-        die "非交互环境请使用: bash -s -- --yes，并通过参数提供必需值"
-      fi
-    fi
-    interactive_wizard
-  fi
-
-  validate_final_inputs
-  install_sing_box
-  cleanup_legacy_renewal_helper
-  configure_firewall
-  prepare_certificate
-
+  prepare_runtime
+  collect_user_options
+  prepare_installation
   local backup_file
-  backup_file="$(write_config_file)"
-  fix_runtime_permissions
-  check_config_or_rollback "$backup_file"
-  restart_service_or_rollback "$backup_file"
-  print_summary
+  backup_file="$(write_and_validate_server_config)"
+  start_service_and_report "$backup_file"
 }
 
 main "$@"
