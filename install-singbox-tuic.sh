@@ -43,6 +43,7 @@ OPEN_FIREWALL=1
 START_SERVICE=1
 INTERACTIVE_INPUT="/dev/stdin"
 INTERACTIVE_FD=""
+PACKAGE_INDEX_UPDATED=0
 
 PORT_SET=0
 UUID_SET=0
@@ -375,6 +376,102 @@ ensure_environment() {
   if [ ! -d /run/systemd/system ]; then
     die "未检测到正在运行的 systemd；本脚本不支持 OpenWrt、Docker 容器或非 systemd 环境"
   fi
+}
+
+package_manager() {
+  if have_cmd apt-get; then
+    printf 'apt'
+  elif have_cmd dnf; then
+    printf 'dnf'
+  elif have_cmd yum; then
+    printf 'yum'
+  elif have_cmd zypper; then
+    printf 'zypper'
+  elif have_cmd pacman; then
+    printf 'pacman'
+  else
+    return 1
+  fi
+}
+
+package_update_index() {
+  local pm
+  pm="$(package_manager 2>/dev/null || true)"
+  [ -n "$pm" ] || return 1
+  [ "$PACKAGE_INDEX_UPDATED" -eq 0 ] || return 0
+
+  case "$pm" in
+    apt)
+      info "更新软件包索引: apt-get update"
+      apt-get update
+      ;;
+    dnf)
+      info "刷新软件包元数据: dnf makecache"
+      dnf makecache
+      ;;
+    yum)
+      info "刷新软件包元数据: yum makecache"
+      yum makecache
+      ;;
+    zypper)
+      info "刷新软件包元数据: zypper refresh"
+      zypper --non-interactive refresh
+      ;;
+    pacman)
+      info "同步软件包数据库: pacman -Sy"
+      pacman -Sy --noconfirm
+      ;;
+  esac
+  PACKAGE_INDEX_UPDATED=1
+}
+
+install_or_update_packages() {
+  local packages="$*"
+  local pm
+  [ -n "$packages" ] || return 0
+  pm="$(package_manager 2>/dev/null || true)"
+  [ -n "$pm" ] || {
+    warn "未识别包管理器，无法自动安装/更新:${packages}"
+    return 1
+  }
+
+  package_update_index || true
+  case "$pm" in
+    apt)
+      info "安装/更新依赖: apt-get install -y ${packages}"
+      apt-get install -y $packages
+      ;;
+    dnf)
+      info "安装/更新依赖: dnf install -y ${packages}"
+      dnf install -y $packages
+      ;;
+    yum)
+      info "安装/更新依赖: yum install -y ${packages}"
+      yum install -y $packages
+      ;;
+    zypper)
+      info "安装/更新依赖: zypper --non-interactive install ${packages}"
+      zypper --non-interactive install $packages
+      ;;
+    pacman)
+      info "安装/更新依赖: pacman -S --noconfirm ${packages}"
+      pacman -S --noconfirm $packages
+      ;;
+  esac
+}
+
+ensure_base_commands() {
+  local missing=""
+
+  info "检查并更新脚本依赖命令"
+  package_update_index || warn "未能自动更新软件包索引；将继续检查已安装命令"
+
+  install_or_update_packages curl openssl qrencode || true
+
+  have_cmd curl || have_cmd wget || missing="${missing} curl/wget"
+  have_cmd openssl || missing="${missing} openssl"
+  have_cmd qrencode || warn "未检测到 qrencode，安装完成后将只输出 JSON 文本和分享链接"
+  [ -z "$missing" ] || die "缺少必需命令:${missing}"
 }
 
 validate_port() {
@@ -1463,7 +1560,6 @@ ensure_acme_standalone_dependency() {
 
 install_acme_runtime_dependencies() {
   local needs_acme_install=0
-  local needs_package_install=0
   local packages=""
 
   if ! have_cmd acme.sh && [ ! -x "$HOME/.acme.sh/acme.sh" ]; then
@@ -1471,29 +1567,13 @@ install_acme_runtime_dependencies() {
   fi
   if ! have_cmd socat && ! have_cmd python3 && ! have_cmd python; then
     packages="${packages} socat"
-    needs_package_install=1
   fi
   if [ "$needs_acme_install" -eq 1 ] && ! have_cmd curl; then
     packages="${packages} curl"
-    needs_package_install=1
   fi
 
-  if [ "$needs_package_install" -eq 1 ]; then
-    info "安装 acme.sh standalone 依赖:${packages}"
-    if have_cmd apt-get; then
-      apt-get update
-      apt-get install -y $packages
-    elif have_cmd dnf; then
-      dnf install -y $packages
-    elif have_cmd yum; then
-      yum install -y $packages
-    elif have_cmd zypper; then
-      zypper --non-interactive install $packages
-    elif have_cmd pacman; then
-      pacman -Sy --noconfirm $packages
-    else
-      warn "未识别包管理器，无法自动安装:${packages}"
-    fi
+  if [ -n "$packages" ]; then
+    install_or_update_packages $packages || true
   fi
 
   if [ "$needs_acme_install" -eq 1 ]; then
@@ -1992,22 +2072,8 @@ install_qrencode_if_missing() {
   if have_cmd qrencode; then
     return 0
   fi
-
-  warn "未检测到 qrencode，尝试安装以显示二维码"
-  if have_cmd apt-get; then
-    apt-get update >/dev/null 2>&1 || true
-    apt-get install -y qrencode >/dev/null 2>&1 || true
-  elif have_cmd dnf; then
-    dnf install -y qrencode >/dev/null 2>&1 || true
-  elif have_cmd yum; then
-    yum install -y qrencode >/dev/null 2>&1 || true
-  elif have_cmd zypper; then
-    zypper --non-interactive install qrencode >/dev/null 2>&1 || true
-  elif have_cmd pacman; then
-    pacman -Sy --noconfirm qrencode >/dev/null 2>&1 || true
-  fi
-
-  have_cmd qrencode
+  warn "未检测到 qrencode，跳过二维码生成"
+  return 1
 }
 
 write_client_json() {
@@ -2027,15 +2093,42 @@ write_client_json() {
 
   cat <<EOF
 {
-  "type": "tuic",
-  "tag": "tuic-out",
-  "server": $(json_string "$server"),
-  "server_port": ${PORT},
-  "uuid": $(json_string "$UUID_VALUE"),
-  "password": $(json_string "$PASSWORD_VALUE"),
-  "congestion_control": $(json_string "$CONGESTION"),
-  "tls": {
-    "enabled": true${server_name_line}${tls_extra}
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-out",
+      "server": $(json_string "$server"),
+      "server_port": ${PORT},
+      "uuid": $(json_string "$UUID_VALUE"),
+      "password": $(json_string "$PASSWORD_VALUE"),
+      "congestion_control": $(json_string "$CONGESTION"),
+      "tls": {
+        "enabled": true${server_name_line}${tls_extra}
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "final": "tuic-out"
   }
 }
 EOF
@@ -2098,7 +2191,7 @@ print_tuic_share() {
 }
 
 print_client_example() {
-  heading "客户端 TUIC outbound JSON"
+  heading "客户端 sing-box 完整 config.json"
   write_client_json
   label_value "JSON 文件" "$CLIENT_JSON_FILE"
 }
@@ -2159,6 +2252,7 @@ main() {
   parse_args "$@"
   validate_supplied_args
   ensure_environment
+  ensure_base_commands
 
   if [ "$YES" -eq 1 ]; then
     noninteractive_defaults
